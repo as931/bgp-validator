@@ -147,7 +147,7 @@
                 globalResults.push(rowData);
                 renderTable(); // Update live
 
-                if (i < prefixes.length - 1) await sleep(100);
+                if (i < prefixes.length - 1) await sleep(0);
             }
 
             status.innerText = `Finished checking ${prefixes.length} prefixes.`;
