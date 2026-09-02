@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BGP Routing Validator</title>
+    <style>
+        :root {
+            --bg: #f8f9fa;
+            --text: #212529;
+            --border: #dee2e6;
+            --green: #d1e7dd;
+            --green-text: #0f5132;
+            --yellow: #fff3cd;
+            --yellow-text: #664d03;
+            --red: #f8d7da;
+            --red-text: #842029;
+        }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 20px; max-width: 1200px; margin: auto; }
+        h1 { font-size: 1.5rem; margin-bottom: 10px; }
+        .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 20px; }
+        textarea { width: 100%; height: 150px; padding: 10px; font-family: monospace; border: 1px solid var(--border); border-radius: 4px; resize: vertical; box-sizing: border-box; }
+        label { font-weight: bold; display: block; margin-bottom: 5px; }
+        .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; }
+        button { padding: 10px 20px; background: #0d6efd; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+        button:hover { background: #0b5ed7; }
+        button:disabled { background: #6c757d; cursor: not-allowed; }
+        #exportBtn { background: #198754; display: none; }
+        #exportBtn:hover { background: #157347; }
+        #status { font-weight: bold; color: #6c757d; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        th, td { padding: 10px; border: 1px solid var(--border); text-align: left; font-size: 0.9rem; }
+        th { background: #e9ecef; position: sticky; top: 0; }
+        
+        .full-match { background: var(--green); color: var(--green-text); font-weight: bold; }
+        .partial-match { background: var(--yellow); color: var(--yellow-text); font-weight: bold; }
+        .no-match { background: var(--red); color: var(--red-text); font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <h1>BGP Routing Validator (IRR & RPKI)</h1>
+    
+    <div class="grid">
+        <div>
+            <label>Prefixes (One per line)</label>
+            <textarea id="prefixesInput" placeholder="38.240.54.0/24&#10;1.1.1.0/24"></textarea>
+        </div>
+        <div>
+            <label>Expected ASNs (One per line)</label>
+            <textarea id="asnsInput" placeholder="931&#10;AS213122"></textarea>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button id="runBtn" onclick="runCheck()">Run Validation</button>
+        <button id="exportBtn" onclick="exportCSV()">Export to CSV</button>
+        <span id="status"></span>
+    </div>
+
+    <div id="tableContainer" style="overflow-x: auto;">
+        <table id="resultsTable" style="display: none;">
+            <thead id="tableHead"></thead>
+            <tbody id="tableBody"></tbody>
+        </table>
+    </div>
+
+    <script>
+        let globalResults = [];
+        let expectedASNs = [];
+
+        // Helper: Delay to respect API rate limits
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        async function runCheck() {
+            const prefixesRaw = document.getElementById('prefixesInput').value.split('\n');
+            const asnsRaw = document.getElementById('asnsInput').value.split('\n');
+            
+            const prefixes = prefixesRaw.map(p => p.trim()).filter(p => p !== '');
+            expectedASNs = [...new Set(asnsRaw.map(a => a.trim().replace(/^AS/i, '')).filter(a => a !== ''))];
+
+            if (prefixes.length === 0 || expectedASNs.length === 0) {
+                alert("Please provide at least one prefix and one ASN.");
+                return;
+            }
+
+            const btn = document.getElementById('runBtn');
+            const status = document.getElementById('status');
+            const table = document.getElementById('resultsTable');
+            const tHead = document.getElementById('tableHead');
+            const tBody = document.getElementById('tableBody');
+            const exportBtn = document.getElementById('exportBtn');
+
+            // Reset UI
+            btn.disabled = true;
+            exportBtn.style.display = 'none';
+            table.style.display = 'table';
+            globalResults = [];
+            tBody.innerHTML = '';
+            
+            // Build Table Header
+            let headHtml = `<tr><th>Prefix</th>`;
+            expectedASNs.forEach(asn => headHtml += `<th>AS${asn}</th>`);
+            headHtml += `<th>Seen IRR</th><th>Seen RPKI</th></tr>`;
+            tHead.innerHTML = headHtml;
+
+            for (let i = 0; i < prefixes.length; i++) {
+                const prefix = prefixes[i];
+                const safePrefix = encodeURIComponent(prefix);
+                status.innerText = `Checking ${i + 1} of ${prefixes.length}: ${prefix}...`;
+
+                let foundIrr = [];
+                let foundRpki = [];
+
+                try {
+                    // 1. Check IRR
+                    const irrRes = await fetch(`https://stat.ripe.net/data/prefix-routing-consistency/data.json?resource=${safePrefix}`);
+                    const irrData = await irrRes.json();
+                    if (irrData.data.routes) {
+                        const routes = irrData.data.routes.filter(r => r.in_whois === true && r.prefix === prefix);
+                        foundIrr = [...new Set(routes.map(r => r.origin.toString()))];
+                    }
+
+                    // 2. Check RPKI
+                    const rpkiRes = await fetch(`https://stat.ripe.net/data/rpki-roas/data.json?resource=${safePrefix}`);
+                    const rpkiData = await rpkiRes.json();
+                    if (rpkiData.data.roas) {
+                        foundRpki = [...new Set(rpkiData.data.roas.map(r => r.asn.toString().replace(/^AS/i, '')))];
+                    }
+                } catch (e) {
+                    console.error(`Failed querying ${prefix}`, e);
+                }
+
+                // Process Results
+                let rowData = { prefix, asns: {}, seenIrr: foundIrr.length ? foundIrr.map(a=>'AS'+a).join(', ') : 'None', seenRpki: foundRpki.length ? foundRpki.map(a=>'AS'+a).join(', ') : 'None' };
+                let tr = document.createElement('tr');
+                let rowHtml = `<td><strong>${prefix}</strong></td>`;
+
+                expectedASNs.forEach(asn => {
+                    const hasIrr = foundIrr.includes(asn);
+                    const hasRpki = foundRpki.includes(asn);
+                    let statusTxt, cssClass;
+
+                    if (hasIrr && hasRpki) {
+                        statusTxt = "Full Match"; cssClass = "full-match";
+                    } else if (hasIrr) {
+                        statusTxt = "Partial (IRR)"; cssClass = "partial-match";
+                    } else if (hasRpki) {
+                        statusTxt = "Partial (RPKI)"; cssClass = "partial-match";
+                    } else {
+                        statusTxt = "No Match"; cssClass = "no-match";
+                    }
+
+                    rowData.asns[asn] = statusTxt;
+                    rowHtml += `<td class="${cssClass}">${statusTxt}</td>`;
+                });
+
+                rowHtml += `<td>${rowData.seenIrr}</td><td>${rowData.seenRpki}</td>`;
+                tr.innerHTML = rowHtml;
+                tBody.appendChild(tr);
+                globalResults.push(rowData);
+
+                // Polite delay for RIPE Stat API (300ms)
+                if (i < prefixes.length - 1) await sleep(300);
+            }
+
+            status.innerText = `Finished checking ${prefixes.length} prefixes.`;
+            btn.disabled = false;
+            exportBtn.style.display = 'inline-block';
+        }
+
+        function exportCSV() {
+            if (globalResults.length === 0) return;
+
+            let csvContent = "Prefix,";
+            expectedASNs.forEach(asn => csvContent += `AS${asn},`);
+            csvContent += "Seen IRR,Seen RPKI\n";
+
+            globalResults.forEach(row => {
+                let csvRow = `"${row.prefix}",`;
+                expectedASNs.forEach(asn => {
+                    csvRow += `"${row.asns[asn]}",`;
+                });
+                csvRow += `"${row.seenIrr}","${row.seenRpki}"`;
+                csvContent += csvRow + "\n";
+            });
+
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.setAttribute("href", url);
+            link.setAttribute("download", "routing-validation.csv");
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+</body>
+</html>
